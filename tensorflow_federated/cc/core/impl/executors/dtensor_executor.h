@@ -21,6 +21,7 @@ limitations under the License
 #include <string>
 
 #include "tensorflow/c/eager/c_api.h"
+#include "tensorflow/dtensor/cc/tensor_layout.h"
 #include "tensorflow_federated/cc/core/impl/executors/executor.h"
 
 namespace tensorflow_federated {
@@ -31,6 +32,7 @@ namespace tensorflow_federated {
 std::shared_ptr<Executor> CreateDTensorExecutor(
     std::optional<std::string> dtensor_device_name,
     std::unique_ptr<TFE_Context, decltype(&TFE_DeleteContext)> context,
+    std::optional<tensorflow::dtensor::Mesh> mesh = std::nullopt,
     int32_t max_concurrent_computation_calls = -1);
 
 }  // namespace tensorflow_federated
