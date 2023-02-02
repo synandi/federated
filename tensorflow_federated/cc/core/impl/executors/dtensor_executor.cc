@@ -29,7 +29,6 @@ limitations under the License
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
 #include "tensorflow/c/eager/c_api.h"
 #include "tensorflow/c/eager/tfe_tensorhandle_internal.h"
 #include "tensorflow/c/tf_status.h"
@@ -37,6 +36,7 @@ limitations under the License
 #include "tensorflow/c/tf_tensor_internal.h"
 #include "tensorflow/core/platform/status.h"
 #include "tensorflow/core/platform/statusor.h"
+#include "tensorflow/dtensor/cc/tensor_layout.h"
 #include "tensorflow_federated/cc/core/impl/executors/dtensor_api.h"
 #include "tensorflow_federated/cc/core/impl/executors/eager_computation.h"
 #include "tensorflow_federated/cc/core/impl/executors/executor.h"
@@ -74,10 +74,11 @@ class Value {
   // calling Computation.
   // TODO(b/256948367) If parameter name has a layout provided in layout map,
   // this method also converts input Tensor to DTensor with given layout.
-  virtual absl::Status Bind(TFE_Context* context,
-                            const v0::TensorFlow::Binding& shape,
-                            std::vector<TFE_TensorHandle*>& bindings,
-                            std::optional<std::string> device_name) = 0;
+  virtual absl::Status Bind(
+      TFE_Context* context, const v0::TensorFlow::Binding& shape,
+      const std::map<std::string, tensorflow::dtensor::Layout>& layout_map,
+      std::vector<TFE_TensorHandle*>& bindings,
+      std::optional<std::string> device_name) = 0;
 
   // Returns value at given index.
   virtual absl::StatusOr<std::shared_ptr<Value>> ElementAt(int index) = 0;
@@ -87,7 +88,9 @@ class Value {
 
 using ExecutorValue = std::shared_ptr<Value>;
 
-absl::StatusOr<ExecutorValue> CreateValueAny(const v0::Value& value_pb);
+absl::StatusOr<ExecutorValue> CreateValueAny(
+    const v0::Value& value_pb,
+    std::optional<tensorflow::dtensor::Mesh> mesh = std::nullopt);
 
 class TensorValue : public Value {
  public:
@@ -104,15 +107,40 @@ class TensorValue : public Value {
         TFE_NewTensorHandle(tensor, status.get()));
   }
 
+  TF_Tensor* GetTensorValue(TFE_Context* context,
+                            std::optional<std::string> device_name,
+                            TF_Status* status) {
+    if (device_name.has_value()) {
+      bool is_dtensor_value = TFE_DTENSOR_IsTensorHandleOnDevice(
+          context, this->value_.get(), device_name.value().c_str(), status);
+      if (TF_GetCode(status) != TF_OK) {
+        return nullptr;
+      }
+      if (is_dtensor_value) {
+        std::unique_ptr<TFE_TensorHandle, decltype(&TFE_DeleteTensorHandle)>
+            tensor_handle_from_dtensor(TFE_DTENSOR_DTensorToTensor(
+                                           context, this->value_.get(),
+                                           device_name.value().c_str(), status),
+                                       TFE_DeleteTensorHandle);
+        if (TF_GetCode(status) != TF_OK) {
+          return nullptr;
+        }
+        return TFE_TensorHandleResolve(tensor_handle_from_dtensor.get(),
+                                       status);
+      }
+    }
+    return TFE_TensorHandleResolve(this->value_.get(), status);
+  }
+
   absl::Status MaterializeValue(TFE_Context* context, v0::Value* value_pb,
                                 std::optional<std::string> device_name,
                                 ParallelTasks& tasks) override {
-    return tasks.add_task([this, device_name, value_pb]() {
+    return tasks.add_task([this, device_name, value_pb, context]() {
       std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
           TF_NewStatus(), TF_DeleteStatus);
+
       std::unique_ptr<TF_Tensor, decltype(&TF_DeleteTensor)> tf_tensor(
-          TFE_TensorHandleResolve(this->value_.get(), status.get()),
-          TF_DeleteTensor);
+          GetTensorValue(context, device_name, status.get()), TF_DeleteTensor);
       if (TF_GetCode(status.get()) != TF_OK) {
         return absl::InternalError(absl::StrCat("Tensor materialize failed: ",
                                                 TF_Message(status.get())));
@@ -135,14 +163,29 @@ class TensorValue : public Value {
         "Call method is allowed only for Computation");
   }
 
-  absl::Status Bind(TFE_Context* context, const v0::TensorFlow::Binding& shape,
-                    std::vector<TFE_TensorHandle*>& bindings,
-                    std::optional<std::string> device_name) override {
+  absl::Status Bind(
+      TFE_Context* context, const v0::TensorFlow::Binding& shape,
+      const std::map<std::string, tensorflow::dtensor::Layout>& layout_map,
+      std::vector<TFE_TensorHandle*>& bindings,
+      std::optional<std::string> device_name) override {
     if (!shape.has_tensor()) {
       return absl::InvalidArgumentError(
           "Attempted to bind tensor value to non-tensor Binding.");
     }
-    bindings.emplace_back(value_.get());
+    auto it = layout_map.find(shape.tensor().tensor_name());
+    if (it != layout_map.end() && device_name.has_value()) {
+      auto layout = it->second;
+      std::unique_ptr<TF_Status, decltype(&TF_DeleteStatus)> status(
+          TF_NewStatus(), TF_DeleteStatus);
+      // Create DTnsor with layout and use it as arg to function.
+      auto* dtensor_value = TFE_DTENSOR_TensorToDTensor(
+          context, value_.get(), tensorflow::wrap(&layout),
+          device_name.value().c_str(), status.get());
+
+      bindings.emplace_back(dtensor_value);
+    } else {
+      bindings.emplace_back(value_.get());
+    }
     return absl::OkStatus();
   }
 
@@ -201,9 +244,11 @@ class StructValue : public Value {
     return ExecutorValue(values_[index]);
   }
 
-  absl::Status Bind(TFE_Context* context, const v0::TensorFlow::Binding& shape,
-                    std::vector<TFE_TensorHandle*>& bindings,
-                    std::optional<std::string> device_name) override {
+  absl::Status Bind(
+      TFE_Context* context, const v0::TensorFlow::Binding& shape,
+      const std::map<std::string, tensorflow::dtensor::Layout>& layout_map,
+      std::vector<TFE_TensorHandle*>& bindings,
+      std::optional<std::string> device_name) override {
     if (!shape.has_struct_()) {
       return absl::InvalidArgumentError(
           "Attempted to bind struct value to non-struct Binding.");
@@ -215,8 +260,8 @@ class StructValue : public Value {
                        shape.struct_().element_size(), " fields."));
     }
     for (int i = 0; i < values_.size(); i++) {
-      TFF_TRY(values_[i]->Bind(context, shape.struct_().element(i), bindings,
-                               device_name));
+      TFF_TRY(values_[i]->Bind(context, shape.struct_().element(i), layout_map,
+                               bindings, device_name));
     }
     return absl::OkStatus();
   }
@@ -260,27 +305,57 @@ absl::StatusOr<ExecutorValue> FromTensorsAndBindingStructure(
 
 class ComputationValue : public Value {
  public:
-  static absl::StatusOr<ExecutorValue> CreateValue(const v0::Value& value_pb) {
+  static absl::StatusOr<ExecutorValue> CreateValue(
+      const v0::Value& value_pb,
+      std::optional<tensorflow::dtensor::Mesh> mesh) {
     if (!value_pb.has_computation()) {
       return absl::InvalidArgumentError(
           "Creating ComputationValue from a non-computation value proto.");
     }
-    auto eager_comp = TFF_TRY(
-        EagerComputation::FromProto(value_pb.computation().tensorflow()));
-    return std::make_shared<ComputationValue>(
-        eager_comp,
-        value_pb.computation().tensorflow().has_parameter()
-            ? std::optional(value_pb.computation().tensorflow().parameter())
-            : std::nullopt,
-        value_pb.computation().tensorflow().result());
+    if (value_pb.computation().has_tensorflow()) {
+      std::map<std::string, tensorflow::dtensor::Layout> layout_map;
+      // Use layout information only when Mesh is present
+      if (mesh.has_value() &&
+          value_pb.computation().tensorflow().has_layout_map()) {
+        for (const auto& sharding : value_pb.computation()
+                                        .tensorflow()
+                                        .layout_map()
+                                        .name_to_sharding_spec()) {
+          std::vector<std::string> sharding_specs =
+              absl::StrSplit(sharding.second, ',');
+          auto layout_or = tensorflow::dtensor::Layout::GetLayout(
+              sharding_specs, mesh.value());
+          if (!layout_or.ok()) {
+            return tensorflow::ToAbslStatus(layout_or.status());
+          }
+          layout_map[sharding.first] = layout_or.value();
+        }
+      }
+
+      auto eager_comp = TFF_TRY(EagerComputation::FromProto(
+          value_pb.computation().tensorflow(), layout_map));
+      return std::make_shared<ComputationValue>(
+          eager_comp,
+          value_pb.computation().tensorflow().has_parameter()
+              ? std::optional(value_pb.computation().tensorflow().parameter())
+              : std::nullopt,
+          value_pb.computation().tensorflow().result(), layout_map);
+    }
+    // TODO(b/256948367): Add creating eager_computation object from
+    // Computation->tensorflow_function.
+    return absl::InvalidArgumentError(
+        "Only tensorflow Computation type is supported.");
   }
 
-  ComputationValue(EagerComputation computation,
-                   std::optional<v0::TensorFlow::Binding> parameter_shape,
-                   v0::TensorFlow::Binding output_shape)
+  ComputationValue(
+      EagerComputation computation,
+      std::optional<v0::TensorFlow::Binding> parameter_shape,
+      v0::TensorFlow::Binding output_shape,
+      std::map<std::string, tensorflow::dtensor::Layout> layout_map)
       : computation_(computation),
         parameter_shape_(parameter_shape),
-        output_shape_(output_shape) {}
+        output_shape_(output_shape),
+        layout_map_(std::move(layout_map)) {}
 
   absl::Status MaterializeValue(TFE_Context* context, v0::Value* value_pb,
                                 std::optional<std::string> device_name,
@@ -294,7 +369,7 @@ class ComputationValue : public Value {
       std::optional<std::string> device_name) override {
     std::vector<TFE_TensorHandle*> flattened_inputs;
     if (arg.has_value()) {
-      TFF_TRY(arg.value()->Bind(context, parameter_shape_.value(),
+      TFF_TRY(arg.value()->Bind(context, parameter_shape_.value(), layout_map_,
                                 flattened_inputs, device_name));
     }
     auto outputs =
@@ -303,9 +378,11 @@ class ComputationValue : public Value {
     return FromTensorsAndBindingStructure(output_shape_, &outputs_span);
   }
 
-  absl::Status Bind(TFE_Context* context, const v0::TensorFlow::Binding& shape,
-                    std::vector<TFE_TensorHandle*>& bindings,
-                    std::optional<std::string> device_name) override {
+  absl::Status Bind(
+      TFE_Context* context, const v0::TensorFlow::Binding& shape,
+      const std::map<std::string, tensorflow::dtensor::Layout>& layout_map,
+      std::vector<TFE_TensorHandle*>& bindings,
+      std::optional<std::string> device_name) override {
     return absl::InvalidArgumentError(
         "Attempted to bind computation value as argument to a TensorFlow "
         "computation. This is not supported.");
@@ -320,9 +397,11 @@ class ComputationValue : public Value {
   EagerComputation computation_;
   std::optional<v0::TensorFlow::Binding> parameter_shape_;
   v0::TensorFlow::Binding output_shape_;
+  std::map<std::string, tensorflow::dtensor::Layout> layout_map_;
 };
 
-absl::StatusOr<ExecutorValue> CreateValueAny(const v0::Value& value_pb) {
+absl::StatusOr<ExecutorValue> CreateValueAny(
+    const v0::Value& value_pb, std::optional<tensorflow::dtensor::Mesh> mesh) {
   VLOG(2) << "Creating value: " << value_pb.Utf8DebugString();
   switch (value_pb.value_case()) {
     case v0::Value::kTensor: {
@@ -332,7 +411,7 @@ absl::StatusOr<ExecutorValue> CreateValueAny(const v0::Value& value_pb) {
       return StructValue::CreateValue(value_pb);
     }
     case v0::Value::kComputation: {
-      return ComputationValue::CreateValue(value_pb);
+      return ComputationValue::CreateValue(value_pb, mesh);
     }
     case v0::Value::kSequence: {
       return absl::UnimplementedError("Sequence is not implemented yet.");
@@ -350,6 +429,7 @@ class DTensorExecutor : public ExecutorBase<ValueFuture> {
   DTensorExecutor(
       std::optional<std::string> dtensor_device_name,
       std::unique_ptr<TFE_Context, decltype(&TFE_DeleteContext)> context,
+      std::optional<tensorflow::dtensor::Mesh> mesh,
       int32_t max_concurrent_computation_calls)
       : context_(std::move(context)),
         dtensor_device_name_(dtensor_device_name),
@@ -360,7 +440,8 @@ class DTensorExecutor : public ExecutorBase<ValueFuture> {
             ((max_concurrent_computation_calls > 0)
                  ? max_concurrent_computation_calls
                  : std::thread::hardware_concurrency() * 4),
-            ExecutorName()) {
+            ExecutorName()),
+        mesh_(mesh) {
     VLOG(2) << "max_concurrent_computation_calls: "
             << max_concurrent_computation_calls_;
     VLOG(2) << "thread pool size: "
@@ -375,8 +456,8 @@ class DTensorExecutor : public ExecutorBase<ValueFuture> {
       const v0::Value& value_pb) final {
     VLOG(2) << "Creating value: " << value_pb.Utf8DebugString();
     return ThreadRun(
-        [value_pb]() -> absl::StatusOr<ExecutorValue> {
-          return CreateValueAny(value_pb);
+        [value_pb, this]() -> absl::StatusOr<ExecutorValue> {
+          return CreateValueAny(value_pb, this->mesh_);
         },
         &thread_pool_);
   }
@@ -439,6 +520,7 @@ class DTensorExecutor : public ExecutorBase<ValueFuture> {
   std::optional<std::string> dtensor_device_name_;
   int32_t max_concurrent_computation_calls_;
   ThreadPool thread_pool_;
+  std::optional<tensorflow::dtensor::Mesh> mesh_;
 };
 
 }  // namespace
@@ -446,9 +528,10 @@ class DTensorExecutor : public ExecutorBase<ValueFuture> {
 std::shared_ptr<Executor> CreateDTensorExecutor(
     std::optional<std::string> dtensor_device_name,
     std::unique_ptr<TFE_Context, decltype(&TFE_DeleteContext)> context,
+    std::optional<tensorflow::dtensor::Mesh> mesh,
     int32_t max_concurrent_computation_calls) {
   return std::make_shared<DTensorExecutor>(dtensor_device_name,
-                                           std::move(context),
+                                           std::move(context), mesh,
                                            max_concurrent_computation_calls);
 }
 }  // namespace tensorflow_federated
